@@ -5,7 +5,7 @@ class ModelLoader:
 	_instance = None
 
 	@classmethod
-	def get_model(cls, model_path: str = "models/lgmb_demand_model.pkl"):
+	def get_model(cls, model_path: str = "models/lgbm_demand_model.pkl"):
 		if cls._instance is None:
 			if not os.path.exists(model_path):
 				raise FileNotFoundError(f"{model_path} does not exist")

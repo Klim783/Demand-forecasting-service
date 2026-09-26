@@ -1,95 +1,109 @@
-import os
+from typing import List
+import joblib
+from fastapi import FastAPI, HTTPException
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
-from contextlib import asynccontextmanager
-
-from app.schemas import StorePredictionRequest, ForecastResponse, DailyForecast
-from app.model_loader import ModelLoader
-from app.feature_engineering import prepare_features
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-	try:
-		ModelLoader.get_model()
-		print("Model loaded")
-	except Exception as e:
-		print(f"Warning on startup: {e}")
-	yield
+from pydantic import BaseModel, Field
 
 app = FastAPI(
-	title="Demand Forecast",
-	description="Demand forecast model",
-	version="1.0",
-	lifespan=lifespan
+    title="Rossmann Store Sales Demand Predictor API", version="2.0.0"
 )
-@app.get("/health")
+
+try:
+  artifact = joblib.load("models/lgbm_demand_model.pkl")
+  models = artifact.get(
+      "models", [artifact.get("model")]
+  )  # Supports single model or ensemble
+  feature_cols = artifact["feature_cols"]
+  metrics = artifact.get("metrics", {})
+except Exception as e:
+  models = []
+  feature_cols = []
+  metrics = {}
+  print(f"Error loading model: {e}")
+
+
+class StoreFeaturesInput(BaseModel):
+  Store: int
+  Open: int = Field(1, description="1 = Open, 0 = Closed")
+  DayOfWeek: int
+  Promo: int
+  SchoolHoliday: int
+  Year: int
+  Month: int
+  Day: int
+  IsWeekend: int
+  WeekOfYear: int
+  IsPayday: int
+  Sin_DayOfYear: float
+  Cos_DayOfYear: float
+  sales_lag_14: float
+  sales_lag_21: float
+  sales_lag_28: float
+  sales_lag_30: float
+  rolling_mean_14: float
+  rolling_std_14: float
+  rolling_mean_30: float
+  store_day_avg_sales: float
+
+
+@app.get("/")
 def health_check():
-    return {"status": "healthy", "model_loaded": os.path.exists("models/lgbm_demand_model.pkl")}
+  return {
+      "status": "ok" if len(models) > 0 else "model_not_loaded",
+      "ensemble_size": len(models),
+      "validation_metrics": metrics,
+  }
 
 
-@app.post("/predict", response_model=ForecastResponse)
-def predict_demand(payload: StorePredictionRequest):
-    try:
-        artifact = ModelLoader.get_model()
-        model = artifact["model"]
-        feature_cols = artifact["feature_cols"]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/predict")
+def predict_sales(payload: StoreFeaturesInput):
+  if not models:
+    raise HTTPException(status_code=500, detail="Model artifact missing.")
 
-    # Generate dates horizon
-    forecast_dates = pd.date_range(start=payload.start_date, periods=payload.horizon_days, freq="D")
+  # Business Rule: Closed stores have zero sales
+  if payload.Open == 0:
+    return {"store_id": payload.Store, "predicted_sales_eur": 0.0}
 
-    # Load historical store baseline if available, or generate context
-    train_path = "data/train.csv"
-    if os.path.exists(train_path):
-        history_df = pd.read_csv(train_path, low_memory=False)
-        history_df = history_df[history_df["Store"] == payload.store_id].sort_values("Date").tail(60)
-    else:
-        history_df = pd.DataFrame()
+  try:
+    data_dict = payload.model_dump()
+    input_df = pd.DataFrame([data_dict])[feature_cols]
 
-    # Build future horizon dataframe
-    future_records = []
-    for d in forecast_dates:
-        future_records.append({
-            "Store": payload.store_id,
-            "Date": d.strftime("%Y-%m-%d"),
-            "Sales": np.nan,
-            "Open": 0 if d.dayofweek == 6 else 1,
-            "Promo": payload.promo,
-            "StateHoliday": "0",
-            "SchoolHoliday": payload.school_holiday,
-        })
-    future_df = pd.DataFrame(future_records)
+    # Ensemble Averaging Across All Folds
+    preds_log = [model.predict(input_df)[0] for model in models]
+    avg_pred_log = np.mean(preds_log)
+    predicted_sales = float(np.expm1(avg_pred_log))
 
-    # Combine historical context and future records for lag calculations
-    combined = pd.concat([history_df, future_df], ignore_index=True)
+    return {
+        "store_id": payload.Store,
+        "predicted_sales_eur": round(max(0.0, predicted_sales), 2),
+    }
+  except Exception as e:
+    raise HTTPException(status_code=400, detail=str(e))
 
-    store_path = "data/store.csv"
-    store_df = pd.read_csv(store_path) if os.path.exists(store_path) else None
 
-    processed = prepare_features(combined, store_df=store_df, is_train=True)
-    future_features = processed.tail(payload.horizon_days).copy()
+@app.post("/predict-batch")
+def predict_batch_sales(payload_list: List[StoreFeaturesInput]):
+  if not models:
+    raise HTTPException(status_code=500, detail="Model artifact missing.")
 
-    # Fill lag NAs if historical context was short
-    for col in feature_cols:
-        if col in future_features.columns:
-            future_features[col] = future_features[col].fillna(future_features[col].median() if not future_features[col].isna().all() else 0)
+  try:
+    df_batch = pd.DataFrame([p.model_dump() for p in payload_list])
 
-    X_pred = future_features[feature_cols]
-    preds = np.clip(model.predict(X_pred), 0, None)
-
-    daily_forecasts = []
-    for i, d in enumerate(forecast_dates):
-        # Sunday closed = 0 sales
-        val = float(preds[i]) if d.dayofweek != 6 else 0.0
-        daily_forecasts.append(DailyForecast(date=d.strftime("%Y-%m-%d"), predicted_sales=round(val, 2)))
-
-    total_sales = sum(f.predicted_sales for f in daily_forecasts)
-
-    return ForecastResponse(
-        store_id=payload.store_id,
-        horizon_days=payload.horizon_days,
-        total_forecasted_sales=round(total_sales, 2),
-        forecasts=daily_forecasts,
+    # Ensemble batch predictions
+    preds_log_list = np.column_stack(
+        [model.predict(df_batch[feature_cols]) for model in models]
     )
+    avg_preds_log = np.mean(preds_log_list, axis=1)
+    predicted_sales = np.expm1(avg_preds_log)
+
+    # Post-processing override for closed stores
+    predicted_sales = np.where(df_batch["Open"] == 0, 0.0, predicted_sales)
+
+    results = [
+        {"store_id": row["Store"], "predicted_sales_eur": round(max(0.0, p), 2)}
+        for row, p in zip(payload_list, predicted_sales)
+    ]
+    return {"batch_predictions": results}
+  except Exception as e:
+    raise HTTPException(status_code=400, detail=str(e))
