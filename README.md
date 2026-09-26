@@ -37,8 +37,6 @@ An end-to-end, production-ready retail demand forecasting system built on the Ro
 └── requirements.txt             # Project dependencies
 ```
 ## 📊 Dashboards & Visualizations
-## 📊 Dashboard & Visualizations
-
 Here is a preview of the interactive Streamlit dashboard and model evaluation outputs:
 
 ![Streamlit UI Demo](assets/img.png)
