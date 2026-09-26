@@ -4,100 +4,110 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
 
 from app.feature_engineering import prepare_features
 
 
-def train_model():
-    train_path = 'data/train.csv'
-    store_path = 'data/store.csv'
+def rmpspe_metric(y_true, y_pred):
+  mask = y_true > 0
+  return np.sqrt(np.mean(((y_true[mask] - y_pred[mask]) / y_true[mask]) ** 2)) * 100
 
-    print(f'Loading Rossmann dataset from {train_path}...')
-    df_raw = pd.read_csv(train_path, low_memory=False)
 
-    store_df = None
-    if os.path.exists(store_path):
-        print(f'Loading store metadata from {store_path}...')
-        store_df = pd.read_csv(store_path)
+def train_oof_pipeline():
+  print("--- Starting Production Out-of-Fold Ensemble Training ---")
 
-    # Filter out closed stores and zero sales for training
-    df_raw = df_raw[(df_raw['Open'] != 0) & (df_raw['Sales'] > 0)].copy()
+  df_raw = pd.read_csv("data/train.csv", low_memory=False)
+  store_df = pd.read_csv("data/store.csv")
 
-    # 1. Feature Engineering
-    print('Generating time-series features (lags, rolling stats, calendar)...')
-    df_processed = prepare_features(
-        df_raw, store_df=store_df, is_train=True
-    ).dropna()
+  # Filter out closed days & abnormal outliers
+  df_raw = df_raw[(df_raw["Open"] == 1) & (df_raw["Sales"] > 0)].copy()
 
-    # 2. Time-Series Validation Split (last 30 days)
-    max_date = df_processed['Date'].max()
-    split_date = max_date - pd.Timedelta(days=30)
+  df_processed = prepare_features(df_raw, store_df=store_df, is_train=True).dropna()
 
-    train_df = df_processed[df_processed['Date'] <= split_date]
-    val_df = df_processed[df_processed['Date'] > split_date]
+  feature_cols = [
+      "Store",
+      "DayOfWeek",
+      "Promo",
+      "SchoolHoliday",
+      "Year",
+      "Month",
+      "Day",
+      "IsWeekend",
+      "WeekOfYear",
+      "IsPayday",
+      "Sin_DayOfYear",
+      "Cos_DayOfYear",
+      "sales_lag_14",
+      "sales_lag_21",
+      "sales_lag_28",
+      "sales_lag_30",
+      "rolling_mean_14",
+      "rolling_std_14",
+      "rolling_mean_30",
+      "store_day_avg_sales",
+  ]
 
-    feature_cols = [
-        'Store',
-        'DayOfWeek',
-        'Promo',
-        'SchoolHoliday',
-        'Year',
-        'Month',
-        'Day',
-        'IsWeekend',
-        'WeekOfYear',
-        'sales_lag_14',
-        'sales_lag_21',
-        'sales_lag_28',
-        'sales_lag_30',
-        'rolling_mean_14',
-        'rolling_std_14',
-        'rolling_mean_30',
-    ]
+  for col in feature_cols:
+    if col in df_processed.columns:
+      df_processed[col] = df_processed[col].fillna(df_processed[col].median())
 
-    if 'CompetitionDistance' in df_processed.columns:
-        feature_cols.append('CompetitionDistance')
+  X = df_processed[feature_cols]
+  y = df_processed["Sales"].values
+  y_log = np.log1p(y)
 
-    target_col = 'Sales'
+  # 5-Fold TimeSeriesSplit Cross Validation
+  tscv = TimeSeriesSplit(n_splits=5)
+  models = []
+  oof_preds = np.zeros(len(X))
 
-    X_train, y_train = train_df[feature_cols], train_df[target_col]
-    X_val, y_val = val_df[feature_cols], val_df[target_col]
+  print("Training 5 LightGBM Fold Models...")
+  for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
+    X_train, y_train_log = X.iloc[train_idx], y_log[train_idx]
+    X_val, y_val_log = X.iloc[val_idx], y_log[val_idx]
 
-    # 3. Model Training
-    print(
-        f'Training LightGBM Regressor on {len(X_train):,} historical rows...'
-    )
     model = LGBMRegressor(
-        n_estimators=500,
-        learning_rate=0.03,
-        num_leaves=63,
-        random_state=42,
+        n_estimators=1200,
+        learning_rate=0.02,
+        num_leaves=127,
+        max_depth=10,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42 + fold,
         n_jobs=-1,
         verbose=-1,
     )
 
-    model.fit(X_train, y_train)
+    model.fit(X_train, y_train_log)
+    val_pred_log = model.predict(X_val)
+    oof_preds[val_idx] = np.expm1(val_pred_log)
+    models.append(model)
+    print(f" Fold {fold + 1} Trained Successfully.")
 
-    # 4. Evaluation
-    val_preds = np.clip(model.predict(X_val), 0, None)
+  # Evaluate Out-of-Fold Performance on valid splits
+  eval_idx = np.where(oof_preds > 0)[0]
+  mae = mean_absolute_error(y[eval_idx], oof_preds[eval_idx])
+  rmse = np.sqrt(mean_squared_error(y[eval_idx], oof_preds[eval_idx]))
+  rmspe = rmpspe_metric(y[eval_idx], oof_preds[eval_idx])
 
-    mae = mean_absolute_error(y_val, val_preds)
-    rmse = np.sqrt(mean_squared_error(y_val, val_preds))
-    wape = np.sum(np.abs(y_val - val_preds)) / np.sum(y_val) * 100
+  print("\n" + "=" * 45)
+  print("      5-FOLD OUT-OF-FOLD METRICS      ")
+  print("=" * 45)
+  print(f" OOF MAE:   €{mae:.2f}")
+  print(f" OOF RMSE:  €{rmse:.2f}")
+  print(f" OOF RMSPE: {rmspe:.2f}%")
+  print("=" * 45 + "\n")
 
-    print('--- Validation Results ---')
-    print(f' MAE:  {mae:.2f}')
-    print(f' RMSE: {rmse:.2f}')
-    print(f' WAPE: {wape:.2f}%')
-
-    # 5. Save Model Artifact
-    os.makedirs('models', exist_ok=True)
-    joblib.dump(
-        {'model': model, 'feature_cols': feature_cols},
-        'models/lgbm_demand_model.pkl',
-    )
-    print(' Model successfully saved to models/lgbm_demand_model.pkl')
+  # Save Ensembled Models & Artifacts
+  os.makedirs("models", exist_ok=True)
+  artifact = {
+      "models": models,
+      "feature_cols": feature_cols,
+      "metrics": {"mae": mae, "rmse": rmse, "rmspe": rmspe},
+  }
+  joblib.dump(artifact, "models/lgbm_demand_model.pkl")
+  print("OOF Ensemble saved to 'models/lgbm_demand_model.pkl'!")
 
 
-if __name__ == '__main__':
-    train_model()
+if __name__ == "__main__":
+  train_oof_pipeline()
