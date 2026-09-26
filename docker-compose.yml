@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  demand-api:
+    build: .
+    container_name: rossmann_demand_api
+    ports:
+      - "8000:8000"
+    restart: always
