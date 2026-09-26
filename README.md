@@ -36,3 +36,15 @@ An end-to-end, production-ready retail demand forecasting system built on the Ro
 ├── docker-compose.yml           # Multi-container orchestration
 └── requirements.txt             # Project dependencies
 ```
+## 📊 Dashboards & Visualizations
+## 📊 Dashboard & Visualizations
+
+Here is a preview of the interactive Streamlit dashboard and model evaluation outputs:
+
+![Streamlit UI Demo](assets/img.png)
+
+*Figure 1: Streamlit dashboard simulating scenario parameters and generating 14-day forecasts via the FastAPI backend.*
+
+![Feature Importance & Validation](assets/img_1.png)
+
+*Figure 2: Validation actual vs predicted sales curves and LightGBM ensemble feature importances.*
