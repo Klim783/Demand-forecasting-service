@@ -1,0 +1,20 @@
+# Python / Virtual Environment
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.idea/
+.vscode/
+
+# Data & Serialized Models
+data/*.csv
+!data/.gitkeep
+models/*.pkl
+!models/.gitkeep
+
+# OS & Testing
+.env
+.DS_Store
+.pytest_cache/
